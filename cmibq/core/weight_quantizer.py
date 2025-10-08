@@ -44,20 +44,36 @@ class QuantizedLinear(nn.Module):
         else:
             self.register_buffer('bias', None)
         
-        # 量化参数
-        if per_channel:
-            self.register_buffer('weight_scale', torch.ones(out_features, 1))
-            self.register_buffer('weight_zero_point', torch.zeros(out_features, 1))
-        else:
-            self.register_buffer('weight_scale', torch.ones(1))
-            self.register_buffer('weight_zero_point', torch.zeros(1))
+        # 创建增强的量化器（支持细粒度和离群值处理）
+        if granularity == 'per_channel':
+            quantizer_dim = out_features
+        elif granularity == 'per_group':
+            quantizer_dim = in_features  
+        else:  # per_tensor
+            quantizer_dim = 1
+        
+        self.weight_quantizer = DifferentiableQuantizer(
+            feature_dim=quantizer_dim,
+            default_bits=num_bits,
+            per_channel=(granularity == 'per_channel'),
+            symmetric=symmetric,
+            granularity=granularity,
+            group_size=group_size,
+            use_outlier_clipping=use_outlier_clipping,
+            clip_percentile=clip_percentile,
+            learnable_clip=learnable_clip
+        )
         
         # 如果使用自适应量化，创建比特分配
         if use_adaptive:
             self.register_buffer('bit_assignment', torch.full((num_groups,), float(num_bits)))
         
-        # 量化的权重（INT4/INT8）
+        # 量化的权重
         self.register_buffer('weight_quantized', None)
+        
+        # 离群值统计
+        self.register_buffer('num_outliers', torch.tensor(0))
+        self.register_buffer('total_elements', torch.tensor(0))
         
         # 初始化
         self.reset_parameters()
@@ -72,7 +88,7 @@ class QuantizedLinear(nn.Module):
     
     def quantize_weight(self, bit_assignment: Optional[torch.Tensor] = None):
         """
-        量化权重
+        量化权重（支持细粒度和离群值处理）
         
         Args:
             bit_assignment: [num_groups] 每组的比特分配
@@ -80,18 +96,105 @@ class QuantizedLinear(nn.Module):
         if bit_assignment is not None and self.use_adaptive:
             self.bit_assignment = bit_assignment
         
-        if self.use_adaptive and bit_assignment is not None:
-            # 混合精度量化
-            self.weight_quantized = self._mixed_precision_quantize(
-                self.weight_fp, 
-                bit_assignment
-            )
-        else:
-            # 统一精度量化
-            self.weight_quantized = self._uniform_quantize(
-                self.weight_fp,
-                self.num_bits
-            )
+        weight = self.weight_fp
+        
+        # 根据粒度处理权重维度
+        if self.granularity == 'per_channel':
+            # 权重shape: [out_features, in_features]
+            # per_channel沿out_features维度量化
+            weight_for_quant = weight.unsqueeze(0).transpose(1, 2)  # [1, in_features, out_features]
+            
+            # 应用量化器
+            if self.use_adaptive and bit_assignment is not None:
+                # 混合精度量化
+                weight_quantized = self._mixed_precision_quantize_with_outliers(
+                    weight_for_quant, bit_assignment
+                )
+            else:
+                # 统一精度量化
+                weight_quantized = self.weight_quantizer(weight_for_quant, self.num_bits)
+            
+            weight_quantized = weight_quantized.transpose(1, 2).squeeze(0)
+            
+        elif self.granularity == 'per_group':
+            # 分组量化
+            weight_for_quant = weight.unsqueeze(0)  # [1, out_features, in_features]
+            
+            if self.use_adaptive and bit_assignment is not None:
+                weight_quantized = self._mixed_precision_quantize_with_outliers(
+                    weight_for_quant, bit_assignment
+                )
+            else:
+                weight_quantized = self.weight_quantizer(weight_for_quant, self.num_bits)
+            
+            weight_quantized = weight_quantized.squeeze(0)
+            
+        else:  # per_tensor
+            # 全局量化
+            weight_flat = weight.view(1, 1, -1)
+            
+            if self.use_adaptive and bit_assignment is not None:
+                weight_quantized = self._mixed_precision_quantize_with_outliers(
+                    weight_flat, bit_assignment
+                )
+            else:
+                weight_quantized = self.weight_quantizer(weight_flat, self.num_bits)
+            
+            weight_quantized = weight_quantized.view_as(weight)
+        
+        self.weight_quantized = weight_quantized
+        
+        # 统计离群值
+        if self.use_outlier_clipping:
+            self._update_outlier_stats(weight)
+    
+    def _mixed_precision_quantize_with_outliers(
+        self, 
+        weight: torch.Tensor,
+        bit_assignment: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        混合精度量化，带离群值处理
+        """
+        out_features, in_features = weight.shape[1], weight.shape[2] if weight.dim() > 2 else weight.shape[1]
+        weight_quantized = torch.zeros_like(weight)
+        
+        for g in range(self.num_groups):
+            start_idx = g * (out_features // self.num_groups)
+            end_idx = (g + 1) * (out_features // self.num_groups) if g < self.num_groups - 1 else out_features
+            
+            # 获取该组的权重
+            if weight.dim() == 3:
+                group_weight = weight[:, start_idx:end_idx, :]
+            else:
+                group_weight = weight[start_idx:end_idx]
+            
+            # 获取该组的比特数
+            group_bits = int(bit_assignment[g].item())
+            
+            # 使用量化器量化该组
+            group_quantized = self.weight_quantizer(group_weight, group_bits)
+            
+            if weight.dim() == 3:
+                weight_quantized[:, start_idx:end_idx, :] = group_quantized
+            else:
+                weight_quantized[start_idx:end_idx] = group_quantized
+        
+        return weight_quantized
+    
+    def _update_outlier_stats(self, weight: torch.Tensor):
+        """更新离群值统计"""
+        clip_min, clip_max = self.weight_quantizer.compute_clip_bounds(weight)
+        if clip_min is not None and clip_max is not None:
+            outliers = ((weight < clip_min) | (weight > clip_max)).sum()
+            self.num_outliers = outliers
+            self.total_elements = weight.numel()
+    
+    def get_outlier_ratio(self) -> float:
+        """获取离群值比例"""
+        if self.total_elements > 0:
+            return (self.num_outliers.float() / self.total_elements).item()
+        return 0.0
     
     def _uniform_quantize(self, weight: torch.Tensor, num_bits: int) -> torch.Tensor:
         """
