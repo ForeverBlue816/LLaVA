@@ -1,9 +1,7 @@
 #!/usr/bin/env python
 """
-CM-IBQ LLaVA训练脚本
-支持两阶段训练：
-  Stage 1: Bottleneck Shaping (量化模块训练)
-  Stage 2: Task-Aware Optimization with Alignment (对齐损失 + LoRA微调)
+CM-IBQ LLaVA训练脚本 - 增强版
+支持两阶段训练，添加了内存优化和更好的错误处理
 """
 
 import os
@@ -13,6 +11,8 @@ import torch
 import random
 import numpy as np
 from pathlib import Path
+import warnings
+import gc
 
 # 添加项目路径
 project_root = Path(__file__).parent.parent
@@ -29,6 +29,124 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    # 确保CUDNN的确定性
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def check_gpu_memory():
+    """检查GPU内存状态"""
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            memory_allocated = torch.cuda.memory_allocated(i) / 1024**3
+            memory_reserved = torch.cuda.memory_reserved(i) / 1024**3
+            total_memory = props.total_memory / 1024**3
+            
+            print(f"GPU {i}: {props.name}")
+            print(f"  Total Memory: {total_memory:.1f} GB")
+            print(f"  Allocated: {memory_allocated:.1f} GB")
+            print(f"  Reserved: {memory_reserved:.1f} GB")
+            print(f"  Free: {total_memory - memory_reserved:.1f} GB")
+
+
+def optimize_model_for_size(model, model_size: str):
+    """
+    根据模型大小应用优化策略
+    
+    Args:
+        model: 模型实例
+        model_size: 模型大小标识符 ('7b', '13b', '34b', '70b')
+    """
+    print(f"\nApplying optimizations for {model_size} model...")
+    
+    # 计算模型参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print(f"Total parameters: {total_params/1e9:.2f}B")
+    print(f"Trainable parameters: {trainable_params/1e6:.2f}M")
+    
+    # 根据模型大小应用不同的优化策略
+    if model_size in ['13b', '34b', '70b']:
+        print("Applying memory optimizations for large model...")
+        
+        # 1. 启用梯度检查点（gradient checkpointing）
+        if hasattr(model, 'gradient_checkpointing_enable'):
+            model.gradient_checkpointing_enable()
+            print("✓ Gradient checkpointing enabled for main model")
+        elif hasattr(model, 'base_model') and hasattr(model.base_model, 'gradient_checkpointing_enable'):
+            model.base_model.gradient_checkpointing_enable()
+            print("✓ Gradient checkpointing enabled for base model")
+        
+        # 2. 对vision tower单独启用梯度检查点
+        try:
+            if hasattr(model, 'base_model'):
+                vision_tower = model.base_model.get_vision_tower()
+                if vision_tower and hasattr(vision_tower, 'gradient_checkpointing_enable'):
+                    vision_tower.gradient_checkpointing_enable()
+                    print("✓ Gradient checkpointing enabled for vision tower")
+        except Exception as e:
+            warnings.warn(f"Could not enable gradient checkpointing for vision tower: {e}")
+        
+        # 3. CPU offloading建议（需要手动在DeepSpeed配置中启用）
+        if model_size in ['34b', '70b']:
+            print("✓ Recommended: Enable CPU offloading in DeepSpeed config")
+            print("  - Use ZeRO Stage 3 with offload_optimizer and offload_param")
+            
+        # 4. 混合精度建议
+        print("✓ Recommended: Use bf16 instead of fp16 for better stability")
+        
+        # 5. 批量大小建议
+        recommended_batch_size = {
+            '13b': 2,
+            '34b': 1,
+            '70b': 1
+        }
+        print(f"✓ Recommended batch size: {recommended_batch_size.get(model_size, 1)}")
+        
+    # 对于7B模型的优化
+    elif model_size == '7b':
+        print("Applying standard optimizations for 7B model...")
+        # 7B模型通常不需要激进的内存优化
+        print("✓ Standard optimization applied")
+        print("✓ Recommended: Use fp16 for faster training")
+    
+    # 清理缓存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+        print("✓ GPU cache cleared")
+    
+    return model
+
+
+def validate_args(args):
+    """验证和调整参数"""
+    # 根据模型大小自动调整批量大小
+    if args.model_size in ['34b', '70b'] and args.batch_size > 1:
+        warnings.warn(f"Batch size {args.batch_size} might be too large for {args.model_size} model. "
+                     f"Consider reducing to 1.")
+    
+    # 检查梯度累积
+    if args.model_size in ['13b', '34b', '70b']:
+        min_grad_accum = {'13b': 8, '34b': 16, '70b': 32}
+        if args.gradient_accumulation_steps < min_grad_accum.get(args.model_size, 8):
+            warnings.warn(f"Consider increasing gradient_accumulation_steps to at least "
+                         f"{min_grad_accum[args.model_size]} for {args.model_size} model")
+    
+    # 检查学习率
+    if args.stage == 2 and args.learning_rate > 1e-5:
+        warnings.warn("Stage 2 typically requires lower learning rate. Consider using 1e-5 or smaller.")
+    
+    # 检查数据路径
+    if not os.path.exists(args.train_data_path):
+        raise FileNotFoundError(f"Training data not found: {args.train_data_path}")
+    
+    if not os.path.exists(args.image_folder):
+        raise FileNotFoundError(f"Image folder not found: {args.image_folder}")
+    
+    return args
 
 
 def parse_args():
@@ -53,7 +171,7 @@ def parse_args():
                        help='量化分组数')
     parser.add_argument('--use_ib', action='store_true', default=True,
                        help='是否使用IB框架')
-    parser.add_argument('--use_lora', action='store_true', default=True,
+    parser.add_argument('--use_lora', action='store_true', default=False,
                        help='是否使用LoRA (Stage 2)')
     parser.add_argument('--lora_rank', type=int, default=16,
                        help='LoRA秩')
@@ -95,7 +213,7 @@ def parse_args():
                        help='随机种子')
     
     # 优化参数
-    parser.add_argument('--use_amp', action='store_true', default=True,
+    parser.add_argument('--use_amp', action='store_true', default=False,
                        help='使用混合精度训练')
     parser.add_argument('--fp16', action='store_true', default=False,
                        help='使用FP16')
@@ -105,6 +223,8 @@ def parse_args():
                        help='使用DeepSpeed')
     parser.add_argument('--gradient_checkpointing', action='store_true',
                        help='使用梯度检查点')
+    parser.add_argument('--auto_optimize', action='store_true', default=True,
+                       help='根据模型大小自动优化')
     
     # 日志和保存
     parser.add_argument('--logging_steps', type=int, default=10,
@@ -133,66 +253,113 @@ def main():
     # 解析参数
     args = parse_args()
     
+    # 验证参数
+    args = validate_args(args)
+    
     # 设置随机种子
     set_seed(args.seed)
     
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 打印配置
+    # 检查GPU状态
+    print("\n" + "=" * 80)
+    print("GPU Status:")
     print("=" * 80)
+    check_gpu_memory()
+    
+    # 打印配置
+    print("\n" + "=" * 80)
     print(f"CM-IBQ LLaVA Training - Stage {args.stage}")
     print("=" * 80)
     print(f"Model: {args.model_path}")
+    print(f"Model size: {args.model_size}")
     print(f"Target bits (act/weight): {args.target_bits_act}/{args.target_bits_weight}")
     print(f"Use IB: {args.use_ib}")
     print(f"Use LoRA: {args.use_lora and args.stage == 2}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Gradient accumulation: {args.gradient_accumulation_steps}")
+    print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
     print(f"Output: {args.output_dir}")
     print("=" * 80)
     
     # 1. 加载模型
     print("\n[1/4] Loading model...")
-    model = CMIBQQuantizedLLaVA(
-        model_path=args.model_path,
-        target_bits_act=args.target_bits_act,
-        target_bits_weight=args.target_bits_weight,
-        use_ib=args.use_ib,
-        use_lora=args.use_lora,
-        lora_rank=args.lora_rank,
-        num_groups=args.num_groups,
-        stage=args.stage,
-        model_base=args.model_base
-    )
+    try:
+        model = CMIBQQuantizedLLaVA(
+            model_path=args.model_path,
+            target_bits_act=args.target_bits_act,
+            target_bits_weight=args.target_bits_weight,
+            use_ib=args.use_ib,
+            use_lora=args.use_lora and args.stage == 2,  # Stage 2才启用LoRA
+            lora_rank=args.lora_rank,
+            num_groups=args.num_groups,
+            stage=args.stage,
+            model_base=args.model_base,
+            use_fallback=True  # 启用fallback机制
+        )
+        
+        print(f"Model loaded successfully!")
+        
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        raise
     
-    print(f"Model loaded successfully!")
-    print(f"Total parameters: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
-    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M")
+    # 2. 应用内存优化
+    if args.auto_optimize:
+        model = optimize_model_for_size(model, args.model_size)
     
-    # 2. 准备数据
+    # 手动启用梯度检查点（如果指定）
+    if args.gradient_checkpointing and not args.auto_optimize:
+        if hasattr(model, 'gradient_checkpointing_enable'):
+            model.gradient_checkpointing_enable()
+            print("✓ Manual gradient checkpointing enabled")
+    
+    # 打印最终的参数统计
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\nFinal parameter count:")
+    print(f"  Total: {total_params/1e9:.3f}B")
+    print(f"  Trainable: {trainable_params/1e6:.2f}M ({trainable_params/total_params*100:.2f}%)")
+    
+    # 3. 准备数据
     print("\n[2/4] Preparing data...")
-    data_module = make_supervised_data_module(
-        tokenizer=model.tokenizer,
-        image_processor=model.image_processor,
-        data_args={
-            'train_data_path': args.train_data_path,
-            'eval_data_path': args.eval_data_path,
-            'image_folder': args.image_folder,
-            'max_length': args.max_length
-        }
-    )
+    try:
+        data_module = make_supervised_data_module(
+            tokenizer=model.tokenizer,
+            image_processor=model.image_processor,
+            data_args={
+                'train_data_path': args.train_data_path,
+                'eval_data_path': args.eval_data_path,
+                'image_folder': args.image_folder,
+                'max_length': args.max_length,
+                'use_mm_proj': True,
+                'image_aspect_ratio': 'pad'
+            }
+        )
+        
+        train_dataset = data_module['train_dataset']
+        eval_dataset = data_module['eval_dataset']
+        
+        print(f"Train samples: {len(train_dataset) if train_dataset else 0}")
+        print(f"Eval samples: {len(eval_dataset) if eval_dataset else 0}")
+        
+    except Exception as e:
+        print(f"Error preparing data: {e}")
+        raise
     
-    train_dataset = data_module['train_dataset']
-    eval_dataset = data_module['eval_dataset']
-    
-    print(f"Train samples: {len(train_dataset) if train_dataset else 0}")
-    print(f"Eval samples: {len(eval_dataset) if eval_dataset else 0}")
-    
-    # 3. 配置训练参数
+    # 4. 配置训练参数
     print("\n[3/4] Configuring trainer...")
     
     # 自动设置run_name
     if args.run_name is None:
-        args.run_name = f"cmibq_stage{args.stage}_{args.target_bits_act}bit"
+        args.run_name = f"cmibq_stage{args.stage}_{args.model_size}_{args.target_bits_act}bit"
+    
+    # 根据模型大小调整精度设置
+    if args.model_size in ['34b', '70b'] and not args.bf16:
+        print("Note: Switching to bf16 for large model stability")
+        args.bf16 = True
+        args.fp16 = False
     
     training_args = {
         # 基础参数
@@ -209,11 +376,11 @@ def main():
         'max_grad_norm': args.max_grad_norm,
         
         # 精度设置
-        'use_amp': args.use_amp,
+        'use_amp': args.use_amp or args.fp16 or args.bf16,
         'fp16': args.fp16,
         'bf16': args.bf16,
         'use_deepspeed': args.use_deepspeed,
-        'gradient_checkpointing': args.gradient_checkpointing,
+        'gradient_checkpointing': args.gradient_checkpointing or args.auto_optimize,
         
         # 日志和保存
         'logging_steps': args.logging_steps,
@@ -233,30 +400,72 @@ def main():
         'static_graph': False
     }
     
-    # 4. 创建训练器
-    trainer = DistributedCMIBQTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        tokenizer=model.tokenizer
-    )
+    # 5. 创建训练器
+    try:
+        trainer = DistributedCMIBQTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            tokenizer=model.tokenizer
+        )
+        
+        print("Trainer initialized successfully")
+        
+    except Exception as e:
+        print(f"Error creating trainer: {e}")
+        raise
     
     # 从检查点恢复
     if args.resume_from_checkpoint:
         print(f"\nResuming from checkpoint: {args.resume_from_checkpoint}")
-        trainer.load_checkpoint(args.resume_from_checkpoint)
+        try:
+            trainer.load_checkpoint(args.resume_from_checkpoint)
+            print("Checkpoint loaded successfully")
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            raise
     
-    # 5. 开始训练
-    print("\n[4/4] Starting training...")
+    # 6. 开始训练前的最终内存检查
+    print("\n[4/4] Pre-training memory status:")
+    check_gpu_memory()
+    
+    # 7. 开始训练
+    print("\nStarting training...")
     print("=" * 80)
     
-    trainer.train()
+    try:
+        trainer.train()
+        
+        print("\n" + "=" * 80)
+        print("Training completed successfully!")
+        print(f"Best model saved to: {os.path.join(args.output_dir, 'best_model')}")
+        print("=" * 80)
+        
+    except KeyboardInterrupt:
+        print("\n" + "=" * 80)
+        print("Training interrupted by user")
+        print("Saving checkpoint...")
+        trainer.save_checkpoint('interrupted_checkpoint')
+        print("Checkpoint saved")
+        print("=" * 80)
+        
+    except Exception as e:
+        print(f"\nError during training: {e}")
+        print("Attempting to save emergency checkpoint...")
+        try:
+            trainer.save_checkpoint('emergency_checkpoint')
+            print("Emergency checkpoint saved")
+        except:
+            print("Failed to save emergency checkpoint")
+        raise
     
-    print("\n" + "=" * 80)
-    print("Training completed!")
-    print(f"Best model saved to: {os.path.join(args.output_dir, 'best_model')}")
-    print("=" * 80)
+    finally:
+        # 清理
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+        print("\nCleanup completed")
 
 
 if __name__ == '__main__':
