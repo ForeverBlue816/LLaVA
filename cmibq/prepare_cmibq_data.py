@@ -229,13 +229,24 @@ class CMIBQDataPreparer:
             pct = info['count'] / len(mix_data) * 100
             print(f"  {source}: {info['count']:,} samples ({pct:.1f}%) - {info['description']}")
         
-        # Stage 2策略：保持数据多样性的同时强调对齐任务
-        if max_samples < len(mix_data):
-            print(f"\nSampling {max_samples:,} from {len(mix_data):,} samples...")
-            
-            # 分层采样以保持多样性
-            sampled_data = self._stratified_sampling(mix_data, max_samples, data_sources)
-            mix_data = sampled_data
+        # ⭐⭐⭐ 修改：使用全部数据或快速随机采样
+        if max_samples >= len(mix_data):
+            # 使用全部数据
+            print(f"\n✓ Using all {len(mix_data):,} samples (no sampling)")
+        else:
+            # 快速随机采样（不用慢的分层采样）
+            print(f"\n⚡ Fast random sampling: {max_samples:,} from {len(mix_data):,} samples...")
+            import random
+            random.seed(42)
+            mix_data = random.sample(mix_data, max_samples)
+            print(f"✓ Sampled {len(mix_data):,} samples")
+        
+        # 原来的慢速分层采样代码（已注释）
+        # if max_samples < len(mix_data):
+        #     print(f"\nSampling {max_samples:,} from {len(mix_data):,} samples...")
+        #     # 分层采样以保持多样性（很慢！）
+        #     sampled_data = self._stratified_sampling(mix_data, max_samples, data_sources)
+        #     mix_data = sampled_data
         
         print(f"\nProcessing {len(mix_data):,} samples for Stage 2...")
         
@@ -393,12 +404,43 @@ class CMIBQDataPreparer:
         
         return variant
     
+
+    
+    def _stratified_sampling(self, data: List[Dict], target_size: int, sources: Dict) -> List[Dict]:
+        """分层采样以保持数据多样性"""
+        sampled_data = []
+        
+        for source in sources:
+            # 获取该来源的所有数据
+            source_data = [item for item in data 
+                          if self._get_source_from_id(item.get('id', '')) == source]
+            
+            # 计算该来源应该采样的数量
+            source_ratio = sources[source]['count'] / len(data)
+            sample_size = int(target_size * source_ratio)
+            
+            if sample_size > 0 and source_data:
+                # 随机采样
+                sampled = random.sample(source_data, min(sample_size, len(source_data)))
+                sampled_data.extend(sampled)
+        
+        # 如果采样数量不足，随机补充
+        if len(sampled_data) < target_size:
+            remaining = target_size - len(sampled_data)
+            unused = [item for item in data if item not in sampled_data]
+            if unused:
+                additional = random.sample(unused, min(remaining, len(unused)))
+                sampled_data.extend(additional)
+        
+        return sampled_data[:target_size]
+    
     def _analyze_data_sources(self, data: List[Dict]) -> Dict:
-        """分析数据来源"""
+        """分析数据来源 - 修复版"""
         sources = {}
         
         for item in data:
-            item_id = item.get('id', '').lower()
+            # 安全地获取ID并转换为字符串
+            item_id = str(item.get('id', '')).lower()
             
             # 识别数据来源
             if 'gqa' in item_id:
@@ -431,38 +473,13 @@ class CMIBQDataPreparer:
             sources[source]['count'] += 1
         
         return sources
-    
-    def _stratified_sampling(self, data: List[Dict], target_size: int, sources: Dict) -> List[Dict]:
-        """分层采样以保持数据多样性"""
-        sampled_data = []
-        
-        for source in sources:
-            # 获取该来源的所有数据
-            source_data = [item for item in data 
-                          if self._get_source_from_id(item.get('id', '')) == source]
-            
-            # 计算该来源应该采样的数量
-            source_ratio = sources[source]['count'] / len(data)
-            sample_size = int(target_size * source_ratio)
-            
-            if sample_size > 0 and source_data:
-                # 随机采样
-                sampled = random.sample(source_data, min(sample_size, len(source_data)))
-                sampled_data.extend(sampled)
-        
-        # 如果采样数量不足，随机补充
-        if len(sampled_data) < target_size:
-            remaining = target_size - len(sampled_data)
-            unused = [item for item in data if item not in sampled_data]
-            if unused:
-                additional = random.sample(unused, min(remaining, len(unused)))
-                sampled_data.extend(additional)
-        
-        return sampled_data[:target_size]
-    
+
+
     def _get_source_from_id(self, item_id: str) -> str:
-        """从ID推断数据来源"""
-        item_id = item_id.lower()
+        """从ID推断数据来源 - 修复版"""
+        # 确保item_id是字符串
+        item_id = str(item_id).lower()
+        
         if 'gqa' in item_id:
             return 'GQA'
         elif 'ocr' in item_id:

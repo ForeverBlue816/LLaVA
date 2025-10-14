@@ -152,7 +152,17 @@ def validate_args(args):
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='CM-IBQ LLaVA Training')
-    
+    parser.add_argument('--quantize_weights', action='store_true', default=True,
+                       help='是否量化权重')
+    parser.add_argument('--weight_quant_mode', type=str, default='mixed',
+                       choices=['uniform', 'mixed'],
+                       help='权重量化模式：uniform(统一精度)或mixed(混合精度)')
+    parser.add_argument('--llm_layer_interval', type=int, default=2,
+                       help='LLM层量化间隔（每隔几层量化一次）')
+    parser.add_argument('--quantize_vision_embeddings', action='store_true', default=False,
+                       help='是否量化vision embeddings')
+    parser.add_argument('--quantize_lm_head', action='store_true', default=False,
+                       help='是否量化语言模型输出头')
     # 模型参数
     parser.add_argument('--model_path', type=str, required=True,
                        help='LLaVA模型路径')
@@ -274,7 +284,13 @@ def main():
     print("=" * 80)
     print(f"Model: {args.model_path}")
     print(f"Model size: {args.model_size}")
-    print(f"Target bits (act/weight): {args.target_bits_act}/{args.target_bits_weight}")
+    print(f"Activation quantization: {args.target_bits_act} bits")
+    print(f"Weight quantization: {args.target_bits_weight} bits ({args.weight_quant_mode} mode)")
+    print(f"  - Quantize weights: {args.quantize_weights}")
+    if args.quantize_weights:
+        print(f"  - LLM layer interval: every {args.llm_layer_interval} layers")
+        print(f"  - Quantize vision embeddings: {args.quantize_vision_embeddings}")
+        print(f"  - Quantize LM head: {args.quantize_lm_head}")
     print(f"Use IB: {args.use_ib}")
     print(f"Use LoRA: {args.use_lora and args.stage == 2}")
     print(f"Batch size: {args.batch_size}")
@@ -288,15 +304,22 @@ def main():
     try:
         model = CMIBQQuantizedLLaVA(
             model_path=args.model_path,
+            # 激活量化参数
             target_bits_act=args.target_bits_act,
+            # 权重量化参数（新增）
             target_bits_weight=args.target_bits_weight,
+            quantize_weights=args.quantize_weights,
+            weight_quant_mode=args.weight_quant_mode,
+            llm_layer_interval=args.llm_layer_interval,
+            quantize_vision_embeddings=args.quantize_vision_embeddings,
+            quantize_lm_head=args.quantize_lm_head,
+            # 其他参数
             use_ib=args.use_ib,
-            use_lora=args.use_lora and args.stage == 2,  # Stage 2才启用LoRA
+            use_lora=args.use_lora and args.stage == 2,
             lora_rank=args.lora_rank,
             num_groups=args.num_groups,
             stage=args.stage,
-            model_base=args.model_base,
-            use_fallback=True  # 启用fallback机制
+            model_base=args.model_base
         )
         
         print(f"Model loaded successfully!")
@@ -433,14 +456,29 @@ def main():
     # 7. 开始训练
     print("\nStarting training...")
     print("=" * 80)
-    
+
     try:
         trainer.train()
+        
+        # 获取最终的量化统计（新增）
+        if hasattr(model, 'get_quantization_stats'):
+            final_stats = model.get_quantization_stats()
+            print("\n" + "=" * 80)
+            print("Final Quantization Statistics:")
+            print("=" * 80)
+            if 'weight_avg_bits' in final_stats:
+                print(f"Weight average bits: {final_stats['weight_avg_bits']:.2f}")
+                print(f"Weight quantized layers: {final_stats.get('weight_quantized_layers', 0)}")
+            print(f"Activation average bits (vision): {final_stats.get('vision_act_avg_bits', 'N/A')}")
+            print(f"Activation average bits (projector): {final_stats.get('projector_act_avg_bits', 'N/A')}")
         
         print("\n" + "=" * 80)
         print("Training completed successfully!")
         print(f"Best model saved to: {os.path.join(args.output_dir, 'best_model')}")
         print("=" * 80)
+
+
+
         
     except KeyboardInterrupt:
         print("\n" + "=" * 80)
