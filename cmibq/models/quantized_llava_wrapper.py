@@ -394,6 +394,9 @@ class CMIBQQuantizedLLaVA(nn.Module):
     
     def _create_quantized_linear(self, original_layer):
         """创建量化的Linear层"""
+        # 获取原始层的设备
+        device = original_layer.weight.device
+        
         quantized_layer = QuantizedLinear(
             in_features=original_layer.in_features,
             out_features=original_layer.out_features,
@@ -404,6 +407,9 @@ class CMIBQQuantizedLLaVA(nn.Module):
             num_groups=self.num_groups,
             use_adaptive=(self.weight_quant_mode == 'mixed')
         )
+        
+        # 将量化层移到正确的设备
+        quantized_layer = quantized_layer.to(device)
         
         # 复制权重
         quantized_layer.weight_fp.data = original_layer.weight.data.clone()
@@ -417,11 +423,11 @@ class CMIBQQuantizedLLaVA(nn.Module):
     
     def _create_quantized_conv2d(self, original_layer):
         """创建量化的Conv2d层（用于Vision Tower）"""
-        # 这里简化处理：将Conv2d展开为等效的Linear进行量化
-        # 实际应用中可能需要更复杂的Conv2d量化实现
+        # 获取原始层的设备
+        device = original_layer.weight.device
         
         class QuantizedConv2d(nn.Module):
-            def __init__(self, original_conv, target_bits, num_groups):
+            def __init__(self, original_conv, target_bits, num_groups, device):
                 super().__init__()
                 self.conv = original_conv  # 保留原始conv用于结构
                 
@@ -444,6 +450,9 @@ class CMIBQQuantizedLLaVA(nn.Module):
                     num_groups=min(num_groups, self.out_channels),
                     use_adaptive=False  # Conv2d使用统一量化
                 )
+                
+                # 将量化层移到正确的设备
+                self.quantized_weight = self.quantized_weight.to(device)
                 
                 self.quantized_weight.weight_fp.data = weight_2d
                 if original_conv.bias is not None:
@@ -468,7 +477,7 @@ class CMIBQQuantizedLLaVA(nn.Module):
                     self.stride, self.padding, self.dilation, self.groups
                 )
         
-        return QuantizedConv2d(original_layer, self.target_bits_weight, self.num_groups)
+        return QuantizedConv2d(original_layer, self.target_bits_weight, self.num_groups, device)
     
     def _create_ib_weight_quantizer_for_vision(self):
         """为Vision Tower创建基于IB的权重量化器"""
@@ -762,7 +771,40 @@ class CMIBQQuantizedLLaVA(nn.Module):
         print(f"\nTotal parameters: {total_params/1e9:.3f}B")
         print(f"Trainable parameters: {trainable_params/1e6:.2f}M ({trainable_params/total_params*100:.2f}%)")
         print("="*80)
-    
+
+    def _create_ib_weight_quantizer_for_vision(self):
+        """为Vision Tower创建基于IB的权重量化器"""
+        vision_ib_modules = nn.ModuleDict({
+            'importance': HybridImportanceEstimation(
+                feature_dim=self.vision_dim,
+                num_groups=self.num_groups
+            ),
+            'bit_allocator': BitAllocationNetwork(
+                feature_dim=self.vision_dim,
+                num_groups=self.num_groups,
+                target_bits=self.target_bits_weight,
+                bit_levels=[2, 4, 8]
+            )
+        })
+        
+        self.weight_quantizers['vision_ib'] = vision_ib_modules
+
+    def _create_ib_weight_quantizer_for_projector(self):
+        """为Projector创建基于IB的权重量化器"""
+        projector_ib_modules = nn.ModuleDict({
+            'importance': HybridImportanceEstimation(
+                feature_dim=self.projection_output_dim,
+                num_groups=self.num_groups
+            ),
+            'bit_allocator': BitAllocationNetwork(
+                feature_dim=self.projection_output_dim,
+                num_groups=self.num_groups,
+                target_bits=self.target_bits_weight,
+                bit_levels=[2, 4, 8]
+            )
+        })
+        
+        self.weight_quantizers['projector_ib'] = projector_ib_modules
     def _calculate_compression_ratio(self):
         """计算模型压缩率"""
         total_original_size = 0
@@ -819,8 +861,12 @@ class CMIBQQuantizedLLaVA(nn.Module):
                         # 归一化
                         importance = (importance - importance.min()) / (importance.max() - importance.min() + 1e-8)
                         
-                        # 分配比特
-                        allocation_result = ib_module['bit_allocator'](importance.unsqueeze(0))
+                        # 分配比特 - 注意这里的访问方式变了
+                        if isinstance(ib_module, nn.ModuleDict):
+                            allocation_result = ib_module['bit_allocator'](importance.unsqueeze(0))
+                        else:  # 如果使用方法1的包装类
+                            allocation_result = ib_module.bit_allocator(importance.unsqueeze(0))
+                        
                         bit_assignment = allocation_result['bit_assignment'].squeeze(0)
                         
                         # 更新量化
@@ -828,6 +874,8 @@ class CMIBQQuantizedLLaVA(nn.Module):
                         
                         avg_bits = bit_assignment.mean().item()
                         print(f"  {layer_name}: {avg_bits:.2f} bits")
+    
+
     
     def get_quantization_stats(self):
         """获取完整的量化统计"""
