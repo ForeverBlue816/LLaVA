@@ -4,53 +4,71 @@ import torch.nn.functional as F
 from typing import Optional, List, Tuple, Union
 import copy
 
-from llava.model.language_model.llava_llama import LlavaLlamaForCausalLM, LlavaConfig
+from llava.model.language_model.llava_llama import LlavaLlamaForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class LlavaCIBD(LlavaLlamaForCausalLM):
     """
-    真正的CIBD压缩模型：
-    1. 学生模型参数量真正减少
-    2. 信息瓶颈用于指导压缩
-    3. 保留原始文本序列
+    CIBD压缩模型：
+    1. 学生模型参数量真正减少（通过config控制）
+    2. 信息瓶颈用于视觉特征压缩
+    3. 保留原始文本序列，不覆盖
+    4. Teacher-Student正确分路
     """
     
     def __init__(self, config, teacher_model=None):
-        # 调用父类构造函数，创建较小的学生模型
+        # 创建较小的学生模型
         super().__init__(config)
         
         self.teacher_model = teacher_model
+        self.config = config
+        
         if teacher_model:
             # 冻结教师模型
             for param in self.teacher_model.parameters():
                 param.requires_grad = False
             self.teacher_model.eval()
         
-        # 添加信息瓶颈模块（用于视觉特征压缩）
+        # 信息瓶颈模块（只用于视觉特征）
         self.visual_compressor = VisualInformationBottleneck(
             input_dim=config.hidden_size,
-            bottleneck_dim=config.hidden_size // 2,  # 压缩到一半
+            bottleneck_dim=int(config.hidden_size * 0.6),  
             output_dim=config.hidden_size
         )
         
-        # 特征对齐投影（用于匹配教师模型维度）
-        teacher_hidden_size = teacher_model.config.hidden_size if teacher_model else config.hidden_size
-        if teacher_hidden_size != config.hidden_size:
-            self.feature_projector = nn.Linear(config.hidden_size, teacher_hidden_size)
-        else:
-            self.feature_projector = nn.Identity()
+        # 特征对齐投影（如果学生和教师维度不同）
+        if teacher_model:
+            teacher_hidden = teacher_model.config.hidden_size
+            student_hidden = config.hidden_size
             
-        # 率失真权衡参数
-        self.beta = nn.Parameter(torch.tensor(1.0))
+            if teacher_hidden != student_hidden:
+                # 需要投影来对齐维度进行蒸馏
+                self.feature_projector = nn.Linear(student_hidden, teacher_hidden)
+                # 反向投影（可选）
+                self.reverse_projector = nn.Linear(teacher_hidden, student_hidden)
+            else:
+                self.feature_projector = nn.Identity()
+                self.reverse_projector = nn.Identity()
+        
+        # 率失真权衡参数（可学习）
+        self.log_beta = nn.Parameter(torch.tensor(0.0))  # exp(0) = 1
         
     def encode_images_with_ib(self, images):
         """使用信息瓶颈编码图像"""
-        # 原始视觉编码
+        # 先用原始方法编码
         image_features = self.encode_images(images)
         
-        # 通过信息瓶颈压缩
-        compressed_features, ib_loss = self.visual_compressor(image_features)
+        # 然后通过信息瓶颈压缩
+        # 注意：只压缩视觉特征，保持序列长度不变
+        batch_size, seq_len, hidden_dim = image_features.shape
+        
+        # Reshape for bottleneck
+        image_features_flat = image_features.view(-1, hidden_dim)
+        compressed_flat, ib_loss = self.visual_compressor(image_features_flat)
+        
+        # Reshape back
+        compressed_features = compressed_flat.view(batch_size, seq_len, hidden_dim)
         
         return compressed_features, ib_loss
     
@@ -68,93 +86,128 @@ class LlavaCIBD(LlavaLlamaForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
-    ):
-        # 保存原始输入用于教师模型
-        original_input_ids = input_ids
-        original_images = images
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
         
+        # 初始化损失
         ib_loss = 0
+        distill_loss = 0
         
-        # 如果有图像，使用信息瓶颈处理
+        # 处理输入
         if images is not None:
-            # 学生路径：压缩图像特征
-            compressed_image_features, ib_loss = self.encode_images_with_ib(images)
+            # 学生路径：使用压缩的视觉特征
+            compressed_images, ib_loss = self.encode_images_with_ib(images)
             
-            # 准备多模态输入（保留文本序列）
-            if inputs_embeds is None:
-                (
-                    input_ids,
-                    position_ids,
-                    attention_mask,
-                    past_key_values,
-                    inputs_embeds,
-                    labels
-                ) = self.prepare_inputs_labels_for_multimodal_compressed(
-                    input_ids,
-                    position_ids,
-                    attention_mask,
-                    past_key_values,
-                    labels,
-                    compressed_image_features,  # 使用压缩后的特征
-                    image_sizes
-                )
+            # 准备学生的输入（使用压缩特征）
+            (
+                student_input_ids,
+                student_position_ids,
+                student_attention_mask,
+                student_past_key_values,
+                student_inputs_embeds,
+                student_labels
+            ) = self.prepare_inputs_labels_for_multimodal(
+                input_ids,
+                position_ids,
+                attention_mask,
+                past_key_values,
+                labels,
+                compressed_images,  # 压缩后的视觉特征
+                image_sizes
+            )
+        else:
+            # 没有图像，直接使用原始输入
+            student_input_ids = input_ids
+            student_position_ids = position_ids
+            student_attention_mask = attention_mask
+            student_past_key_values = past_key_values
+            student_inputs_embeds = inputs_embeds
+            student_labels = labels
         
         # 学生模型前向传播
-        outputs = super(LlavaLlamaForCausalLM, self).forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            labels=labels,
+        outputs = super().forward(
+            input_ids=student_input_ids,
+            attention_mask=student_attention_mask,
+            position_ids=student_position_ids,
+            past_key_values=student_past_key_values,
+            inputs_embeds=student_inputs_embeds,
+            labels=student_labels,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=True,
+            output_hidden_states=True,  # 需要hidden states用于蒸馏
             return_dict=True
         )
         
+        # 基础任务损失
         total_loss = outputs.loss if outputs.loss is not None else 0
         
-        # 添加信息瓶颈损失
+        # 添加信息瓶颈损失（带权重）
         if ib_loss > 0:
-            total_loss = total_loss + self.beta * ib_loss
+            beta = torch.exp(self.log_beta)
+            total_loss = total_loss + beta * ib_loss
         
-        # 知识蒸馏
-        if self.teacher_model is not None and labels is not None:
+        # 知识蒸馏（如果有教师模型）
+        if self.training and self.teacher_model is not None and labels is not None:
             with torch.no_grad():
-                # 教师路径：使用原始输入（不压缩）
-                teacher_outputs = self.teacher_model(
-                    input_ids=original_input_ids,
-                    attention_mask=attention_mask,
-                    images=original_images,
-                    labels=labels,
-                    output_hidden_states=True,
-                    return_dict=True
-                )
+                # 教师路径：使用原始输入（未压缩）
+                if images is not None:
+                    # 教师使用原始图像编码
+                    teacher_outputs = self.teacher_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        images=images,  # 原始图像
+                        image_sizes=image_sizes,
+                        labels=labels,
+                        output_hidden_states=True,
+                        return_dict=True
+                    )
+                else:
+                    teacher_outputs = self.teacher_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        labels=labels,
+                        output_hidden_states=True,
+                        return_dict=True
+                    )
             
-            # KL散度蒸馏
+            # 1. Logits蒸馏（KL散度）
             temperature = 4.0
-            student_logits = outputs.logits / temperature
-            teacher_logits = teacher_outputs.logits / temperature
             
+            # 对齐序列长度（如果需要）
+            student_logits = outputs.logits
+            teacher_logits = teacher_outputs.logits
+            
+            min_seq_len = min(student_logits.size(1), teacher_logits.size(1))
+            student_logits = student_logits[:, :min_seq_len, :]
+            teacher_logits = teacher_logits[:, :min_seq_len, :]
+            
+            # KL散度损失
             kl_loss = F.kl_div(
-                F.log_softmax(student_logits, dim=-1),
-                F.softmax(teacher_logits, dim=-1),
+                F.log_softmax(student_logits / temperature, dim=-1),
+                F.softmax(teacher_logits / temperature, dim=-1),
                 reduction='batchmean'
             ) * (temperature ** 2)
             
-            # 特征蒸馏（最后一层隐藏状态）
+            # 2. 特征蒸馏（隐藏状态）
+            # 选择最后一层
             student_hidden = outputs.hidden_states[-1]
             teacher_hidden = teacher_outputs.hidden_states[-1]
             
-            # 对齐维度
-            if student_hidden.size(-1) != teacher_hidden.size(-1):
-                student_hidden = self.feature_projector(student_hidden)
+            # 对齐维度和序列长度
+            min_seq_len = min(student_hidden.size(1), teacher_hidden.size(1))
+            student_hidden = student_hidden[:, :min_seq_len, :]
+            teacher_hidden = teacher_hidden[:, :min_seq_len, :]
             
-            feature_loss = F.mse_loss(student_hidden, teacher_hidden)
+            # 如果维度不同，需要投影
+            if student_hidden.size(-1) != teacher_hidden.size(-1):
+                student_hidden_proj = self.feature_projector(student_hidden)
+                feature_loss = F.mse_loss(student_hidden_proj, teacher_hidden)
+            else:
+                feature_loss = F.mse_loss(student_hidden, teacher_hidden)
             
             # 组合蒸馏损失
-            distill_loss = 0.5 * kl_loss + 0.5 * feature_loss
+            distill_loss = 0.7 * kl_loss + 0.3 * feature_loss
             total_loss = total_loss + distill_loss
         
         if return_dict:
@@ -165,73 +218,64 @@ class LlavaCIBD(LlavaLlamaForCausalLM):
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
             )
+        
         return (total_loss, outputs.logits)
-    
-    def prepare_inputs_labels_for_multimodal_compressed(
-        self, input_ids, position_ids, attention_mask, 
-        past_key_values, labels, compressed_image_features, image_sizes
-    ):
-        """
-        准备压缩后的多模态输入，保留原始文本序列
-        """
-        # 这里重用父类的方法，但传入压缩后的图像特征
-        # 关键：不覆盖文本tokens，只替换<image>位置的特征
-        return self.prepare_inputs_labels_for_multimodal(
-            input_ids, position_ids, attention_mask,
-            past_key_values, labels, 
-            compressed_image_features,  # 已压缩的特征
-            image_sizes
-        )
 
 
 class VisualInformationBottleneck(nn.Module):
     """
     视觉信息瓶颈模块
-    用于压缩视觉特征并计算率失真损失
+    VAE风格的压缩，带率失真优化
     """
     def __init__(self, input_dim, bottleneck_dim, output_dim):
         super().__init__()
         
-        # 编码器（压缩）
+        # 编码器
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, bottleneck_dim * 2),
-            nn.ReLU(),
+            nn.LayerNorm(bottleneck_dim * 2),
+            nn.GELU(),
             nn.Dropout(0.1)
         )
         
-        # 解码器（重构）
+        # 解码器
         self.decoder = nn.Sequential(
-            nn.Linear(bottleneck_dim, output_dim),
-            nn.ReLU()
+            nn.Linear(bottleneck_dim, input_dim),
+            nn.LayerNorm(input_dim),
+            nn.GELU(),
+            nn.Linear(input_dim, output_dim)
         )
         
         self.bottleneck_dim = bottleneck_dim
         
     def reparameterize(self, mu, log_var):
-        """VAE重参数化"""
+        """重参数化技巧"""
         std = torch.exp(0.5 * log_var)
         eps = torch.randn_like(std)
         return mu + eps * std
     
     def forward(self, x):
-        # 编码
+        # 编码为均值和方差
         stats = self.encoder(x)
         mu, log_var = stats.chunk(2, dim=-1)
         
-        # 采样
+        # 限制log_var的范围，避免数值不稳定
+        log_var = torch.clamp(log_var, min=-10, max=10)
+        
+        # 重参数化采样
         z = self.reparameterize(mu, log_var)
         
         # 解码
         x_recon = self.decoder(z)
         
-        # 计算IB损失
-        # KL散度（率）
-        kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=-1).mean()
+        # 计算损失
+        # KL散度（信息率）
+        kl_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
         
         # 重构损失（失真）
         recon_loss = F.mse_loss(x_recon, x)
         
-        # 总IB损失
+        # 总的IB损失
         ib_loss = kl_loss + recon_loss
         
         return x_recon, ib_loss
