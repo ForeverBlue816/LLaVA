@@ -8,7 +8,11 @@ from llava.model.language_model.llava_llama import LlavaConfig
 def create_compressed_student_config(teacher_config, compression_ratio=0.5):
     """
     创建压缩后的学生模型配置
-    使用半自动策略：基于压缩率自动计算各维度
+    新策略：
+    - 固定16层（偶数层，对称性好）
+    - hidden_size 和 heads 保持不变（避免embedding问题）
+    - 只压缩 FFN (intermediate_size)
+    - 保持所有 embedding 相关配置不变
     """
     student_config = copy.deepcopy(teacher_config)
     
@@ -18,81 +22,89 @@ def create_compressed_student_config(teacher_config, compression_ratio=0.5):
     teacher_intermediate = teacher_config.intermediate_size
     teacher_heads = teacher_config.num_attention_heads
     
-    # 半自动计算策略：根据压缩率分配到不同维度
+    # ===== 新压缩策略：固定16层，只压缩FFN =====
+    
+    # 1. 层数固定为16（你的要求）
+    target_layers = 16
+    
+    # 2. 根据 compression_ratio 调整 FFN 压缩程度
     if compression_ratio <= 0.3:
-        # 激进压缩：优先减少层数，其次减少宽度
-        layer_ratio = 0.4  # 层数保留40%
-        width_ratio = 0.75  # 宽度保留75%
-        ffn_ratio = 0.6    # FFN保留60%
+        ffn_ratio = 0.5    # FFN保留50%
     elif compression_ratio <= 0.5:
-        # 中等压缩：平衡减少
-        layer_ratio = 0.6  # 层数保留60%
-        width_ratio = 0.85  # 宽度保留85%
         ffn_ratio = 0.7    # FFN保留70%
     else:
-        # 轻度压缩：主要减少层数
-        layer_ratio = 0.8  # 层数保留80%
-        width_ratio = 0.95  # 宽度保留95%
-        ffn_ratio = 0.9    # FFN保留90%
+        ffn_ratio = 0.85   # FFN保留85%
     
-    # 计算新的配置（保持维度为合理的倍数）
-    student_config.num_hidden_layers = max(4, int(teacher_layers * layer_ratio))
+    student_config.num_hidden_layers = target_layers
     
-    # hidden_size必须能被num_attention_heads整除
-    # 同时最好是64的倍数（对GPU友好）
-    new_hidden = int(teacher_hidden * width_ratio)
-    new_hidden = (new_hidden // 64) * 64  # 向下取整到64的倍数
-    new_hidden = max(256, new_hidden)  # 至少256维
+    # 3. ===== 关键！hidden_size 和 heads 完全不变 =====
+    student_config.hidden_size = teacher_hidden
+    student_config.num_attention_heads = teacher_heads
     
-    # 计算新的注意力头数（必须能整除hidden_size）
-    new_heads = int(teacher_heads * width_ratio)
-    # 确保hidden_size能被heads整除
-    while new_hidden % new_heads != 0 and new_heads > 1:
-        new_heads -= 1
-    new_heads = max(4, new_heads)  # 至少4个头
-    
-    # FFN维度（通常是hidden_size的倍数）
+    # 4. 只压缩 FFN
     new_intermediate = int(teacher_intermediate * ffn_ratio)
-    # 确保是256的倍数（对GPU友好）
-    new_intermediate = (new_intermediate // 256) * 256
+    new_intermediate = (new_intermediate // 256) * 256  # 对齐到256
     new_intermediate = max(512, new_intermediate)
-    
-    # 应用计算后的配置
-    student_config.num_hidden_layers = student_config.num_hidden_layers
-    student_config.hidden_size = new_hidden
     student_config.intermediate_size = new_intermediate
-    student_config.num_attention_heads = new_heads
     
-    # 如果使用了GQA（grouped-query attention），也需要调整
+    # 5. GQA配置保持不变
     if hasattr(teacher_config, 'num_key_value_heads'):
-        new_kv_heads = max(1, new_heads // 4)  # 通常kv_heads是heads的1/4
-        student_config.num_key_value_heads = new_kv_heads
+        student_config.num_key_value_heads = teacher_config.num_key_value_heads
     
-    # 添加压缩相关配置
+    # 6. ===== 保持所有 embedding 相关配置不变 =====
+    if hasattr(teacher_config, 'vocab_size'):
+        student_config.vocab_size = teacher_config.vocab_size
+        print(f"✓ 保持 vocab_size: {teacher_config.vocab_size}")
+    
+    if hasattr(teacher_config, 'max_position_embeddings'):
+        student_config.max_position_embeddings = teacher_config.max_position_embeddings
+        print(f"✓ 保持 max_position_embeddings: {teacher_config.max_position_embeddings}")
+    
+    # 保持特殊token配置
+    if hasattr(teacher_config, 'pad_token_id'):
+        student_config.pad_token_id = teacher_config.pad_token_id
+    if hasattr(teacher_config, 'bos_token_id'):
+        student_config.bos_token_id = teacher_config.bos_token_id
+    if hasattr(teacher_config, 'eos_token_id'):
+        student_config.eos_token_id = teacher_config.eos_token_id
+    
+    # RoPE配置
+    if hasattr(teacher_config, 'rope_theta'):
+        student_config.rope_theta = teacher_config.rope_theta
+    if hasattr(teacher_config, 'rope_scaling'):
+        student_config.rope_scaling = teacher_config.rope_scaling
+    
+    # 7. 标记
     student_config.compression_ratio = compression_ratio
     student_config.use_information_bottleneck = True
     
-    # 打印压缩配置
-    print(f"\n{'='*50}")
+    # 8. 打印配置
+    print(f"\n{'='*60}")
     print("Student Model Configuration:")
-    print(f"{'='*50}")
-    print(f"Layers: {teacher_layers} -> {student_config.num_hidden_layers} ({layer_ratio:.0%})")
-    print(f"Hidden: {teacher_hidden} -> {new_hidden} ({new_hidden/teacher_hidden:.0%})")
-    print(f"FFN: {teacher_intermediate} -> {new_intermediate} ({new_intermediate/teacher_intermediate:.0%})")
-    print(f"Heads: {teacher_heads} -> {new_heads} ({new_heads/teacher_heads:.0%})")
+    print(f"{'='*60}")
+    print(f"Layers: {teacher_layers} -> {student_config.num_hidden_layers} "
+          f"({student_config.num_hidden_layers/teacher_layers:.0%})")
+    print(f"Hidden: {teacher_hidden} (保持不变)")
+    print(f"FFN: {teacher_intermediate} -> {new_intermediate} "
+          f"({new_intermediate/teacher_intermediate:.0%})")
+    print(f"Heads: {teacher_heads} (保持不变)")
+    print(f"Vocab: {teacher_config.vocab_size} (保持不变)")
     
-    # 估算参数量减少
+    # 估算压缩
     teacher_params_est = estimate_model_params(teacher_config)
     student_params_est = estimate_model_params(student_config)
     actual_compression = student_params_est / teacher_params_est
-    print(f"Estimated compression: {actual_compression:.2%} (target: {compression_ratio:.0%})")
-    print(f"{'='*50}\n")
+    
+    print(f"\n参数量: {teacher_params_est/1e9:.2f}B -> {student_params_est/1e9:.2f}B")
+    print(f"实际压缩率: {actual_compression:.2%}")
+    print(f"参数减少: {(teacher_params_est - student_params_est)/1e9:.2f}B")
+    print(f"{'='*60}\n")
     
     return student_config
 
 
 def estimate_model_params(config):
-    """估算模型参数量"""
+    """估算模型参数量（更精确）"""
     params = 0
     vocab_size = getattr(config, 'vocab_size', 32000)
     hidden = config.hidden_size
@@ -102,13 +114,13 @@ def estimate_model_params(config):
     # Embeddings
     params += vocab_size * hidden
     
-    # Each transformer layer
+    # Transformer layers
     per_layer = 0
     # Attention (Q,K,V,O)
     per_layer += 4 * hidden * hidden
-    # MLP
+    # MLP (gate, up, down)
     per_layer += 3 * hidden * intermediate
-    # LayerNorms
+    # LayerNorms (2 per layer)
     per_layer += 4 * hidden
     
     params += layers * per_layer
@@ -122,36 +134,33 @@ def estimate_model_params(config):
 def initialize_student_from_teacher(student_model, teacher_model, student_config):
     """
     从教师模型初始化学生模型权重
-    智能处理维度不匹配问题
+    由于hidden_size相同，大部分权重可以直接复制
     """
     teacher_state = teacher_model.state_dict()
     student_state = student_model.state_dict()
     
-    # 统计信息
     initialized = 0
     skipped = 0
     truncated = 0
     
-    # 层映射策略
     teacher_layers = teacher_model.config.num_hidden_layers
     student_layers = student_config.num_hidden_layers
     
-    # 均匀选择要保留的层
+    # 均匀选择要保留的层（0, 2, 4, 6, ..., 30 → 0-15）
     layer_indices = torch.linspace(0, teacher_layers-1, student_layers).long().tolist()
     layer_map = {i: layer_indices[i] for i in range(student_layers)}
     
-    print(f"Layer mapping: {layer_map}")
+    print(f"\nLayer mapping (student -> teacher):")
+    print(f"  {layer_map}")
     
-    # 遍历学生模型的所有参数
     for name, param in student_state.items():
-        # 跳过IB模块和特殊投影层
-        if 'visual_compressor' in name or 'feature_projector' in name or 'beta' in name:
+        # 跳过特殊模块
+        if 'visual_compressor' in name or 'visual_decoder' in name or 'feature_projector' in name or 'beta' in name:
             skipped += 1
             continue
-            
+        
         # 处理transformer层
         if 'model.layers' in name or 'layers.' in name:
-            # 提取层号
             import re
             layer_match = re.search(r'layers\.(\d+)\.', name)
             if layer_match:
@@ -159,7 +168,6 @@ def initialize_student_from_teacher(student_model, teacher_model, student_config
                 
                 if student_layer_idx in layer_map:
                     teacher_layer_idx = layer_map[student_layer_idx]
-                    # 构造对应的教师参数名
                     teacher_name = name.replace(
                         f'layers.{student_layer_idx}.', 
                         f'layers.{teacher_layer_idx}.'
@@ -168,19 +176,18 @@ def initialize_student_from_teacher(student_model, teacher_model, student_config
                     if teacher_name in teacher_state:
                         teacher_param = teacher_state[teacher_name]
                         
-                        # 智能初始化
                         if param.shape == teacher_param.shape:
-                            # 维度完全匹配
+                            # 完全匹配，直接复制
                             param.data.copy_(teacher_param.data)
                             initialized += 1
                         else:
-                            # 维度不匹配，需要截断或填充
+                            # 维度不匹配（主要是FFN）
                             if init_param_with_mismatch(param, teacher_param, name):
                                 truncated += 1
                             else:
                                 skipped += 1
-                                
-        # 处理embedding和其他层
+        
+        # 处理 embedding、lm_head 等（应该完全匹配）
         elif name in teacher_state:
             teacher_param = teacher_state[name]
             
@@ -193,66 +200,57 @@ def initialize_student_from_teacher(student_model, teacher_model, student_config
                 else:
                     skipped += 1
     
-    print(f"\nWeight initialization statistics:")
-    print(f"  Initialized (exact match): {initialized}")
-    print(f"  Truncated/Padded: {truncated}")
-    print(f"  Skipped: {skipped}")
-    print(f"  Total: {len(student_state)}")
+    print(f"\nWeight initialization:")
+    print(f"  ✓ Exact match: {initialized}")
+    print(f"  ✓ Truncated/Padded: {truncated}")
+    print(f"  - Skipped: {skipped}")
+    print(f"  Total params: {len(student_state)}")
     
     return student_model
 
 
 def init_param_with_mismatch(student_param, teacher_param, name):
     """
-    处理维度不匹配的参数初始化
-    返回是否成功初始化
+    处理维度不匹配的参数（主要是FFN的权重）
     """
     s_shape = student_param.shape
     t_shape = teacher_param.shape
     
-    # 只处理相同维数的tensor
     if len(s_shape) != len(t_shape):
         return False
     
     try:
         if len(s_shape) == 1:
-            # 一维向量（如LayerNorm的weight/bias）
+            # 一维向量
             min_size = min(s_shape[0], t_shape[0])
             student_param.data[:min_size] = teacher_param.data[:min_size]
             
         elif len(s_shape) == 2:
-            # 二维矩阵（如Linear层的weight）
+            # 二维矩阵（Linear层）
             min_rows = min(s_shape[0], t_shape[0])
             min_cols = min(s_shape[1], t_shape[1])
             student_param.data[:min_rows, :min_cols] = teacher_param.data[:min_rows, :min_cols]
             
-            # 如果学生参数更大，用xavier初始化剩余部分
+            # 如果学生更大，用xavier初始化剩余部分
             if s_shape[0] > t_shape[0] or s_shape[1] > t_shape[1]:
                 nn.init.xavier_uniform_(student_param.data)
-                # 保留已复制的部分
                 student_param.data[:min_rows, :min_cols] = teacher_param.data[:min_rows, :min_cols]
-                
         else:
-            # 更高维度的tensor
-            # 简单策略：只复制能匹配的部分
+            # 更高维
             slices = tuple(slice(0, min(s, t)) for s, t in zip(s_shape, t_shape))
             student_param.data[slices] = teacher_param.data[slices]
-            
-        return True
         
+        return True
     except Exception as e:
         print(f"Failed to initialize {name}: {e}")
         return False
 
 
 def analyze_compression(teacher_model, student_model):
-    """
-    分析压缩效果
-    """
+    """分析压缩效果"""
     teacher_params = sum(p.numel() for p in teacher_model.parameters())
     student_params = sum(p.numel() for p in student_model.parameters())
     
-    # 分层统计
     teacher_layer_params = {}
     student_layer_params = {}
     
@@ -268,21 +266,23 @@ def analyze_compression(teacher_model, student_model):
             student_layer_params[layer_type] = 0
         student_layer_params[layer_type] += param.numel()
     
-    print(f"\n{'='*50}")
+    print(f"\n{'='*60}")
     print("Compression Analysis:")
-    print(f"{'='*50}")
+    print(f"{'='*60}")
     print(f"Total parameters:")
-    print(f"  Teacher: {teacher_params/1e6:.2f}M")
-    print(f"  Student: {student_params/1e6:.2f}M")
+    print(f"  Teacher: {teacher_params/1e9:.2f}B ({teacher_params/1e6:.2f}M)")
+    print(f"  Student: {student_params/1e9:.2f}B ({student_params/1e6:.2f}M)")
     print(f"  Reduction: {(1 - student_params/teacher_params)*100:.1f}%")
     
     print(f"\nPer-module compression:")
-    for module in teacher_layer_params:
+    for module in sorted(teacher_layer_params.keys()):
         if module in student_layer_params:
             t_params = teacher_layer_params[module]
             s_params = student_layer_params[module]
             reduction = (1 - s_params/t_params) * 100
-            print(f"  {module}: {t_params/1e6:.2f}M -> {s_params/1e6:.2f}M ({reduction:.1f}% reduced)")
+            print(f"  {module}: {t_params/1e6:.1f}M -> {s_params/1e6:.1f}M ({reduction:.1f}% reduced)")
+    
+    print(f"{'='*60}\n")
     
     return {
         'teacher_params': teacher_params,
